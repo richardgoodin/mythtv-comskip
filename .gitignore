@@ -1,0 +1,28 @@
+# Temporary files
+*.tmp
+*.log
+*.swp
+*.swo
+*~
+
+# Comskip output files
+*.txt
+*.edl
+*.logo.txt
+*.log.txt
+
+# Backup files
+*~
+mythcomskip~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Perl compiled files
+*.pm.bak
+*.pl.bak

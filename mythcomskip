@@ -1,0 +1,388 @@
+#! /bin/perl
+
+use strict;
+use warnings;
+use DBI;
+use File::Temp qw(tempdir);
+use Getopt::Long;
+use POSIX qw(strftime);
+use Time::Local;
+
+# version
+my $VERSION = "2.1.0";
+
+# nice the script
+setpriority(0, $$, 20);
+
+# mythtv recordings directory
+my $myth_dir = "/mnt/mythtv";
+
+# config directory
+my $config_dir = "/home/mythtv/code/mythtv-comskip";
+
+# database connection info
+my $db_name = "mythconverg";
+my $db_host = "localhost";
+my $db_user = "mythtv";
+my $db_pass = "mythtv";
+
+# markup types
+my $MARKUP_COMMFLAG = -3;
+my $MARKUP_COMM_START = 4;
+my $MARKUP_COMM_END = 5;
+
+# parse command line options
+my $help = 0;
+my $version = 0;
+my $noclean = 0;
+my $localtime = 0;
+
+GetOptions(
+    'help|h'      => \$help,
+    'version|v'   => \$version,
+    'noclean'     => \$noclean,
+    'localtime|l' => \$localtime,
+) or die "Error in command line arguments\n";
+
+# handle --help
+if ($help) {
+    print_help();
+    exit(0);
+}
+
+# handle --version
+if ($version) {
+    print "mythcomskip version $VERSION\n";
+    exit(0);
+}
+
+# validate arguments
+my $num_args = $#ARGV + 1;
+if ($num_args != 3) {
+    print "usage: mythcomskip [OPTIONS] <JOBID> <CHANID> <STARTTIMEUTC>\n";
+    print "Try 'mythcomskip --help' for more information.\n";
+    exit(-1);
+}
+
+my ($jobid, $chanid, $start) = @ARGV;
+
+# convert local time to UTC if --localtime flag is used
+if ($localtime) {
+    $start = convert_localtime_to_utc($start);
+    print "Converted to UTC: $start\n";
+}
+
+# main execution
+my $dbh = connect_database();
+my $recording_file = find_recording_file($chanid, $start);
+my ($title, $subtitle) = get_recording_info($dbh, $chanid, $start, $recording_file);
+
+print "MythTV Commercial Flagger, flagging commercials for:\n";
+print "    $title - $subtitle\n";
+
+my $tmpdir = create_temp_directory($title);
+create_symlink($recording_file, $tmpdir);
+
+my $breaks = process_recording($dbh, $tmpdir, $title, $jobid, $chanid, $start);
+
+cleanup_temp_directory($tmpdir, $noclean);
+
+printf("%d commercial breaks\n", $breaks);
+
+$dbh->disconnect;
+exit($breaks);
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+sub print_help {
+    print "MythTV Commercial Skip Flagging Script\n";
+    print "Usage: mythcomskip [OPTIONS] <JOBID> <CHANID> <STARTTIME>\n\n";
+    print "Options:\n";
+    print "  --help, -h        Display this help message\n";
+    print "  --version, -v     Display version information\n";
+    print "  --noclean         Keep temporary files (don't delete temp directory)\n";
+    print "  --localtime, -l   Interpret STARTTIME as local time (default: UTC)\n\n";
+    print "Arguments:\n";
+    print "  JOBID             MythTV job ID (use 0 if not running as a job)\n";
+    print "  CHANID            Channel ID\n";
+    print "  STARTTIME         Recording start time (UTC by default, or local with --localtime)\n";
+    print "                    Format: YYYYMMDDhhmmss (e.g., 20231206143000)\n";
+}
+
+sub connect_database {
+    my $dbh = DBI->connect(
+        "dbi:mysql:database=$db_name:host=$db_host",
+        $db_user,
+        $db_pass
+    ) || die "Cannot connect to database ($!)\n";
+    return $dbh;
+}
+
+sub find_recording_file {
+    my ($chanid, $start) = @_;
+    my $base_filename = "$myth_dir/${chanid}_${start}";
+    
+    my @extensions = ('.mpg', '.ts', '.nuv');
+    foreach my $ext (@extensions) {
+        if (-e "$base_filename$ext") {
+            return "$base_filename$ext";
+        }
+    }
+    
+    die "No recording found matching: ${chanid}_${start}.(mpg|ts|nuv) in $myth_dir\n";
+}
+
+sub get_recording_info {
+    my ($dbh, $chanid, $start, $recording_file) = @_;
+    
+    # Extract basename from full path
+    my $basename = $recording_file;
+    $basename =~ s/^.*\///;  # Remove path
+    
+    my $sql = 'SELECT title, subtitle FROM recorded WHERE basename=?';
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($basename) || die "Could not execute ($sql)\n";
+    
+    my ($title, $subtitle) = $sth->fetchrow_array;
+    return ($title, $subtitle);
+}
+
+sub convert_localtime_to_utc {
+    my ($timestr) = @_;
+    
+    # Parse time string: YYYYMMDDhhmmss
+    if ($timestr !~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/) {
+        die "Invalid time format. Expected YYYYMMDDhhmmss\n";
+    }
+    
+    my ($year, $mon, $mday, $hour, $min, $sec) = ($1, $2, $3, $4, $5, $6);
+    
+    # Convert to epoch time (assuming local time)
+    my $epoch = timelocal($sec, $min, $hour, $mday, $mon - 1, $year);
+    
+    # Convert back to UTC time string
+    my $utc_time = strftime("%Y%m%d%H%M%S", gmtime($epoch));
+    
+    return $utc_time;
+}
+
+sub sanitize_for_filename {
+    my ($text) = @_;
+    
+    # Convert to lowercase and replace spaces with underscores
+    $text = lc($text);
+    $text =~ s/\s+/_/g;
+    
+    # Remove or replace special characters
+    $text =~ s/[^a-z0-9_-]//g;
+    
+    # Limit length to 30 characters
+    $text = substr($text, 0, 30);
+    
+    # Remove trailing underscores or dashes
+    $text =~ s/[_-]+$//;
+    
+    return $text;
+}
+
+sub create_temp_directory {
+    my ($title) = @_;
+    
+    my $sanitized_title = sanitize_for_filename($title);
+    my $pattern = "mythcomskip-${sanitized_title}-XXXXXX";
+    
+    my $tmpdir = tempdir($pattern, DIR => "/tmp", CLEANUP => 0);
+    print "Using temp directory: $tmpdir\n";
+    return $tmpdir;
+}
+
+sub create_symlink {
+    my ($recording_file, $tmpdir) = @_;
+    my $link_target = "$tmpdir/comskip.ts";
+    system("ln -s '$recording_file' '$link_target'") == 0
+        or die "Failed to create symlink: $!\n";
+}
+
+sub get_comskip_command {
+    my ($tmpdir, $title) = @_;
+    
+    my $base_cmd = "cd $tmpdir ; comskip --threads=8 --quiet";
+    
+    if ($title eq 'Survivor') {
+        printf("Survivor\n");
+        return "$base_cmd --ini=$config_dir/comskipsvr.ini --logo=$config_dir/cbs.logo comskip.ts 2>&1";
+    } else {
+        printf("General\n");
+        return "$base_cmd --ini=$config_dir/comskip.ini comskip.ts 2>&1";
+    }
+}
+
+sub run_comskip {
+    my ($tmpdir, $title, $jobid, $dbh) = @_;
+    
+    my $cmd = get_comskip_command($tmpdir, $title);
+    open(my $comskip, '-|', $cmd) or die "Cannot run comskip: $!\n";
+    
+    local $/ = "\r";
+    local $| = 1;
+    
+    while (<$comskip>) {
+        if (/\sfps\).+\((.+)\sfps\),\s(\d+)%/) {
+            my ($fps, $percent) = ($1, $2);
+            printf("\r%3d%%/%4.0dfps  \r", int($percent), $fps);
+            
+            if ($jobid != 0) {
+                update_job_status($dbh, $jobid, sprintf("%3d%%/%4.0dfps", int($percent), $fps));
+            }
+        }
+    }
+    
+    close($comskip);
+}
+
+sub update_job_status {
+    my ($dbh, $jobid, $status) = @_;
+    
+    my $sql = 'UPDATE jobqueue SET status=4, comment=? WHERE id=?';
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($status, $jobid) || die "Could not execute ($sql)\n";
+}
+
+sub delete_old_markup {
+    my ($dbh, $chanid, $start) = @_;
+    
+    my @markup_types = ($MARKUP_COMMFLAG, $MARKUP_COMM_START, $MARKUP_COMM_END);
+    
+    foreach my $type (@markup_types) {
+        my $sql = 'DELETE FROM recordedmarkup WHERE type=? AND chanid=? AND starttime=?';
+        my $sth = $dbh->prepare($sql);
+        $sth->execute($type, $chanid, $start) || die "Could not execute ($sql)\n";
+    }
+}
+
+sub parse_comskip_log {
+    my ($tmpdir) = @_;
+    
+    my $log_file = "$tmpdir/comskip.log";
+    open(my $log_fh, '<', $log_file) or die "No comskip log file: $!\n";
+    
+    # Find block list section
+    while (my $row = <$log_fh>) {
+        last if $row =~ /\QBlock list after weighing\E/;
+    }
+    
+    # Skip header lines
+    <$log_fh>;
+    <$log_fh>;
+    
+    my @commercials;
+    my $in_commercial = 0;
+    my ($commercial_start, $commercial_end);
+    
+    # Process first row
+    my $row = <$log_fh>;
+    my $type = substr($row, 4, 2);
+    my $start_frame = substr($row, 20, 6) + 0;
+    my $end_frame = substr($row, 27, 6) + 0;
+    
+    if ($type eq "--") {
+        $in_commercial = 1;
+        $commercial_start = $start_frame;
+        $commercial_end = $end_frame;
+    }
+    
+    # Process remaining rows
+    while ($row = <$log_fh>) {
+        last if length($row) == 2;
+        
+        $type = substr($row, 4, 2);
+        $start_frame = substr($row, 20, 6) + 0;
+        $end_frame = substr($row, 27, 6) + 0;
+        
+        if ($type eq "--") {
+            if ($in_commercial) {
+                # Continue commercial - update end frame
+                $commercial_end = $end_frame;
+            } else {
+                # New commercial
+                $in_commercial = 1;
+                $commercial_start = $start_frame;
+                $commercial_end = $end_frame;
+            }
+        } else {
+            if ($in_commercial) {
+                # End of commercial - save it
+                push @commercials, [$commercial_start, $commercial_end];
+                $in_commercial = 0;
+            }
+        }
+    }
+    
+    # Handle case where recording ends in commercial
+    if ($in_commercial) {
+        push @commercials, [$commercial_start, $commercial_end];
+    }
+    
+    close($log_fh);
+    return @commercials;
+}
+
+sub insert_commercial_marks {
+    my ($dbh, $chanid, $start, @commercials) = @_;
+    
+    my $sql = 'INSERT INTO recordedmarkup (chanid, starttime, mark, type) VALUES (?, ?, ?, ?)';
+    my $sth = $dbh->prepare($sql);
+    
+    # Insert initial commflag marker
+    $sth->execute($chanid, $start, 0, $MARKUP_COMMFLAG) || die "Could not execute ($sql)\n";
+    
+    # Insert commercial break markers
+    foreach my $commercial (@commercials) {
+        my ($comm_start, $comm_end) = @$commercial;
+        $sth->execute($chanid, $start, $comm_start, $MARKUP_COMM_START) || die "Could not execute ($sql)\n";
+        $sth->execute($chanid, $start, $comm_end, $MARKUP_COMM_END) || die "Could not execute ($sql)\n";
+    }
+    
+    return scalar(@commercials);
+}
+
+sub set_commflagged {
+    my ($dbh, $chanid, $start) = @_;
+    
+    my $sql = 'UPDATE recorded SET commflagged=1 WHERE chanid=? AND starttime=?';
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($chanid, $start) || die "Could not execute ($sql)\n";
+}
+
+sub process_recording {
+    my ($dbh, $tmpdir, $title, $jobid, $chanid, $start) = @_;
+    
+    # Run comskip
+    run_comskip($tmpdir, $title, $jobid, $dbh);
+    
+    # Delete old commercial marks
+    delete_old_markup($dbh, $chanid, $start);
+    
+    # Parse comskip results
+    my @commercials = parse_comskip_log($tmpdir);
+    
+    # Insert new commercial marks
+    my $breaks = insert_commercial_marks($dbh, $chanid, $start, @commercials);
+    
+    # Set commercial flagging complete
+    set_commflagged($dbh, $chanid, $start);
+    
+    return $breaks;
+}
+
+sub cleanup_temp_directory {
+    my ($tmpdir, $noclean) = @_;
+    
+    if ($noclean) {
+        print "Temporary directory preserved at: $tmpdir\n";
+    } else {
+        system("rm -rf '$tmpdir'");
+    }
+}
