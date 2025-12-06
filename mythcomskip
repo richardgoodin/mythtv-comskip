@@ -283,6 +283,13 @@ sub parse_comskip_log {
     
     # Process first row
     my $row = <$log_fh>;
+    
+    # Skip if row is too short or invalid
+    if (!defined($row) || length($row) < 34) {
+        close($log_fh);
+        return @commercials;
+    }
+    
     my $type = substr($row, 4, 2);
     my $start_frame = substr($row, 20, 6) + 0;
     my $end_frame = substr($row, 27, 6) + 0;
@@ -297,9 +304,18 @@ sub parse_comskip_log {
     while ($row = <$log_fh>) {
         last if length($row) == 2;
         
+        # Skip lines that are too short or don't match expected format
+        next if length($row) < 34;
+        
         $type = substr($row, 4, 2);
-        $start_frame = substr($row, 20, 6) + 0;
-        $end_frame = substr($row, 27, 6) + 0;
+        my $start_str = substr($row, 20, 6);
+        my $end_str = substr($row, 27, 6);
+        
+        # Skip if values aren't numeric
+        next if ($start_str !~ /^\d+$/ || $end_str !~ /^\d+$/);
+        
+        $start_frame = $start_str + 0;
+        $end_frame = $end_str + 0;
         
         if ($type eq "--") {
             if ($in_commercial) {
