@@ -9,7 +9,7 @@ use POSIX qw(strftime);
 use Time::Local;
 
 # version
-my $VERSION = "2.1.0";
+my $VERSION = "2.2.0";
 
 # nice the script
 setpriority(0, $$, 20);
@@ -298,6 +298,8 @@ sub parse_comskip_log {
         $in_commercial = 1;
         $commercial_start = $start_frame;
         $commercial_end = $end_frame;
+    } else {
+        $in_commercial = 0;
     }
     
     # Process remaining rows
