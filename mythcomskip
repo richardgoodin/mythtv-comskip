@@ -9,7 +9,7 @@ use POSIX qw(strftime);
 use Time::Local;
 
 # version
-my $VERSION = "2.2.0";
+my $VERSION = "2.3.0";
 
 # nice the script
 setpriority(0, $$, 20);
@@ -313,7 +313,9 @@ sub parse_comskip_log {
         my $start_str = substr($row, 20, 6);
         my $end_str = substr($row, 27, 6);
         
-        # Skip if values aren't numeric
+        # Trim whitespace and check if numeric (skip "######" overflow values)
+        $start_str =~ s/^\s+|\s+$//g;
+        $end_str =~ s/^\s+|\s+$//g;
         next if ($start_str !~ /^\d+$/ || $end_str !~ /^\d+$/);
         
         $start_frame = $start_str + 0;
